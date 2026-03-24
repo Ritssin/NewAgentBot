@@ -17,10 +17,12 @@ Run:
 
 from __future__ import annotations
 
+import html
 import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import feedparser
@@ -40,6 +42,9 @@ DEFAULT_RSS_FEEDS = [
 # How many items to keep after merging all feeds (by recency).
 TOP_N_STORIES = 8
 
+# Where the HTML briefing is written (override with OUTPUT_HTML in .env).
+DEFAULT_OUTPUT_HTML = "output/briefing.html"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -50,6 +55,7 @@ class Settings:
     openai_api_key: str
     openai_base_url: str | None
     model: str
+    output_html: str
 
 
 def load_settings() -> Settings:
@@ -64,6 +70,7 @@ def load_settings() -> Settings:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    output_html = os.getenv("OUTPUT_HTML", DEFAULT_OUTPUT_HTML).strip()
 
     return Settings(
         rss_urls=rss_urls,
@@ -71,6 +78,7 @@ def load_settings() -> Settings:
         openai_api_key=api_key,
         openai_base_url=base_url,
         model=model,
+        output_html=output_html,
     )
 
 
@@ -205,6 +213,72 @@ def summarize_with_llm(client: OpenAI, model: str, stories: list[Story]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 4 — Deliver: write a local HTML file (easy to open in a browser)
+# ---------------------------------------------------------------------------
+
+
+def write_briefing_html(
+    path: str,
+    summary: str,
+    stories: list[Story],
+    model: str,
+) -> None:
+    """
+    Build a single self-contained HTML page.
+
+    The LLM text is escaped so arbitrary model output cannot inject HTML/JS.
+    Story titles and links are escaped; links use a safe attribute.
+    """
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    esc_summary = html.escape(summary, quote=False)
+
+    items: list[str] = []
+    for s in stories:
+        title = html.escape(s.title, quote=True)
+        when = html.escape(s.published.isoformat() if s.published else "unknown date", quote=True)
+        if s.link:
+            href = html.escape(s.link, quote=True)
+            items.append(f'<li><a href="{href}" target="_blank" rel="noopener noreferrer">{title}</a> — {when}</li>')
+        else:
+            items.append(f"<li>{title} — {when}</li>")
+
+    stories_html = "\n    ".join(items) if items else "<li>(no stories)</li>"
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>News briefing</title>
+  <style>
+    :root {{ font-family: system-ui, Segoe UI, Roboto, sans-serif; line-height: 1.5; }}
+    body {{ max-width: 52rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }}
+    h1 {{ font-size: 1.35rem; }}
+    .meta {{ color: #555; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+    .summary {{ white-space: pre-wrap; background: #f6f8fa; padding: 1rem 1.25rem; border-radius: 8px; }}
+    h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
+    ul {{ padding-left: 1.25rem; }}
+    a {{ color: #0969da; }}
+  </style>
+</head>
+<body>
+  <h1>News briefing</h1>
+  <p class="meta">Generated {html.escape(generated, quote=True)} · Model {html.escape(model, quote=True)}</p>
+  <h2>Summary</h2>
+  <div class="summary">{esc_summary}</div>
+  <h2>Sources (top stories sent to the model)</h2>
+  <ul>
+    {stories_html}
+  </ul>
+</body>
+</html>
+"""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(doc, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Main — orchestrates the workflow
 # ---------------------------------------------------------------------------
 
@@ -214,9 +288,8 @@ def main() -> int:
 
     if not settings.openai_api_key:
         print(
-            "Missing OPENAI_API_KEY. Copy .env.example to .env and set your key.\n"
-            "Questions: Do you use OpenAI, Azure OpenAI, or a local OpenAI-compatible server? "
-            "Set OPENAI_BASE_URL accordingly for non-default hosts.",
+            "Missing OPENAI_API_KEY. Copy .env.example to .env and set your key from "
+            "https://platform.openai.com/api-keys",
             file=sys.stderr,
         )
         return 1
@@ -243,7 +316,12 @@ def main() -> int:
     client = OpenAI(**client_kwargs)
 
     summary = summarize_with_llm(client, settings.model, top)
-    print("\n--- Briefing ---\n")
+
+    print("Step 4 — Writing HTML briefing…")
+    write_briefing_html(settings.output_html, summary, top, settings.model)
+    print(f"         Saved: {settings.output_html}")
+
+    print("\n--- Briefing (same as in HTML) ---\n")
     print(summary)
     print("\n--- End ---")
     return 0

@@ -1,6 +1,8 @@
 .env
 .venv/
 venv/
+# Generated briefing (re-create with: python news_agent.py)
+output/
 __pycache__/
 *.py[cod]
 *.egg-info/
