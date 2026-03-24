@@ -33,8 +33,8 @@ Edit `.env` (see below).
 ## Ollama (local)
 
 1. Install and start [Ollama](https://ollama.com).  
-2. Pull a model, e.g. `ollama pull llama3.2`.  
-3. In `.env` set **`USE_OLLAMA=1`** and **`OPENAI_MODEL`** to that model name (default in code is `llama3.2`).
+2. Pull a model, e.g. `ollama pull llama3`, or use one already shown by **`ollama list`**.  
+3. In `.env` set **`USE_OLLAMA=1`** and **`OPENAI_MODEL`** to that exact name (e.g. `llama3` or `llama3:latest`). If you see `model not found` / 404, the name does not match an installed model.
 
 Ollama exposes an [OpenAI-compatible API](https://github.com/ollama/ollama/blob/main/docs/openai.md) at `http://localhost:11434/v1`. This project uses the same `openai` Python package with `base_url` pointing there.
 
@@ -54,11 +54,11 @@ By default this writes **`output/briefing.html`** (the `output/` folder is gitig
 
 | Variable | Purpose |
 |----------|---------|
-| `USE_OLLAMA` | `1` / `true` to use local Ollama (defaults: base URL `http://localhost:11434/v1`, placeholder API key, model `llama3.2`). |
+| `USE_OLLAMA` | `1` / `true` to use local Ollama (defaults: base URL `http://localhost:11434/v1`, placeholder API key, model `llama3`). |
 | `LLM_BACKEND` | Optional explicit `ollama` or `openai` (overrides `USE_OLLAMA` when set to `openai`). |
 | `OPENAI_API_KEY` | Required for OpenAI; optional for Ollama (defaults to `ollama`). |
 | `OPENAI_BASE_URL` | Ollama: override host/port if needed. OpenAI: only for non-default endpoints. |
-| `OPENAI_MODEL` | Model name (`llama3.2`, `gpt-4o-mini`, etc.). |
+| `OPENAI_MODEL` | Model name; for Ollama use a name from `ollama list` (e.g. `llama3`). |
 | `OUTPUT_HTML` | Path for the HTML report (default: `output/briefing.html`). |
 | `RSS_FEEDS` | Comma-separated RSS URLs (overrides built-in defaults). |
 | `TOP_N_STORIES` | How many recent items to send to the model (default: 8). |

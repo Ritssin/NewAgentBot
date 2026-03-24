@@ -27,7 +27,7 @@ from typing import Any
 
 import feedparser
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import NotFoundError, OpenAI
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,8 @@ DEFAULT_OUTPUT_HTML = "output/briefing.html"
 
 # Ollama serves an OpenAI-compatible API (see https://github.com/ollama/ollama/blob/main/docs/openai.md ).
 OLLAMA_OPENAI_BASE_URL = "http://localhost:11434/v1"
-OLLAMA_DEFAULT_MODEL = "llama3.2"
+# Default only if OPENAI_MODEL is unset; must match `ollama list` (e.g. llama3, llama3:latest).
+OLLAMA_DEFAULT_MODEL = "llama3"
 # The Python SDK requires a non-empty key; Ollama ignores it locally.
 OLLAMA_PLACEHOLDER_API_KEY = "ollama"
 
@@ -354,7 +355,20 @@ def main() -> int:
         client_kwargs["base_url"] = settings.openai_base_url
     client = OpenAI(**client_kwargs)
 
-    summary = summarize_with_llm(client, settings.model, top)
+    try:
+        summary = summarize_with_llm(client, settings.model, top)
+    except NotFoundError as err:
+        if settings.llm_backend == "ollama":
+            print(
+                f"Ollama does not have model {settings.model!r} (404).\n"
+                f"  Install:  ollama pull {settings.model}\n"
+                f"  Or pick a name from:  ollama list\n"
+                f"Then set OPENAI_MODEL in .env to that exact name.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Model not found: {err}", file=sys.stderr)
+        return 1
 
     print("Step 4 — Writing HTML briefing…")
     write_briefing_html(settings.output_html, summary, top, settings.model)
