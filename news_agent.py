@@ -1,0 +1,253 @@
+"""
+Simple "agentic" news workflow in one script (easy to read top-to-bottom).
+
+What is "agentic" here?
+-----------------------
+We chain explicit steps: perceive (RSS) → select (top stories) → act (call LLM).
+There is no tool loop yet; the point is to see the pipeline clearly. You can
+later swap the LLM step for a planner that calls tools (search, email, etc.).
+
+Run:
+    python -m venv .venv
+    .venv\\Scripts\\activate   # Windows
+    pip install -r requirements.txt
+    copy .env.example .env     # then edit .env
+    python news_agent.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+import feedparser
+from dotenv import load_dotenv
+from openai import OpenAI
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — Configuration (environment + defaults)
+# ---------------------------------------------------------------------------
+
+DEFAULT_RSS_FEEDS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://rss.cnn.com/rss/edition_world.rss",
+]
+
+# How many items to keep after merging all feeds (by recency).
+TOP_N_STORIES = 8
+
+
+@dataclass(frozen=True)
+class Settings:
+    """All runtime settings in one place."""
+
+    rss_urls: list[str]
+    top_n: int
+    openai_api_key: str
+    openai_base_url: str | None
+    model: str
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+    feeds_env = os.getenv("RSS_FEEDS")
+    if feeds_env:
+        rss_urls = [u.strip() for u in feeds_env.split(",") if u.strip()]
+    else:
+        rss_urls = list(DEFAULT_RSS_FEEDS)
+
+    top_n = int(os.getenv("TOP_N_STORIES", str(TOP_N_STORIES)))
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+    return Settings(
+        rss_urls=rss_urls,
+        top_n=top_n,
+        openai_api_key=api_key,
+        openai_base_url=base_url,
+        model=model,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Perceive: fetch and parse RSS
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Story:
+    """One news item we can summarize."""
+
+    title: str
+    link: str
+    summary: str
+    published: datetime | None
+
+
+def _parse_published(entry: Any) -> datetime | None:
+    """Best-effort parse of RSS/Atom date fields."""
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
+        t = entry.published_parsed
+        try:
+            return datetime(t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(entry, "updated_parsed") and entry.updated_parsed:
+        t = entry.updated_parsed
+        try:
+            return datetime(t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def fetch_stories_from_feed(url: str) -> list[Story]:
+    """Download one feed and normalize entries to Story objects."""
+    parsed = feedparser.parse(url)
+    if not parsed.entries:
+        exc = getattr(parsed, "bozo_exception", None)
+        detail = f" ({exc})" if exc else ""
+        raise RuntimeError(f"No entries from feed {url!r}{detail}")
+
+    out: list[Story] = []
+    for entry in parsed.entries:
+        title = (entry.get("title") or "").strip()
+        link = (entry.get("link") or "").strip()
+        summary = (entry.get("summary") or entry.get("description") or "").strip()
+        # Strip basic HTML noise from some feeds (keep it simple).
+        summary = summary.replace("<![CDATA[", "").replace("]]>", "")
+        if not title:
+            continue
+        out.append(Story(title=title, link=link, summary=summary, published=_parse_published(entry)))
+    return out
+
+
+def fetch_all_stories(urls: list[str]) -> list[Story]:
+    """Step 1 (full): aggregate stories from every configured feed."""
+    all_stories: list[Story] = []
+    for url in urls:
+        try:
+            all_stories.extend(fetch_stories_from_feed(url))
+        except RuntimeError as err:
+            print(f"Warning: {err}", file=sys.stderr)
+    return all_stories
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Select: rank and take top N (by publication time)
+# ---------------------------------------------------------------------------
+
+
+def select_top_stories(stories: list[Story], n: int) -> list[Story]:
+    """
+    Step 2: choose the N most recent items.
+
+    Real agents might use relevance scoring, deduplication, or user prefs here.
+    """
+    # None dates sort last
+    def sort_key(s: Story) -> datetime:
+        return s.published or datetime.min.replace(tzinfo=timezone.utc)
+
+    sorted_stories = sorted(stories, key=sort_key, reverse=True)
+    return sorted_stories[:n]
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Act: send a prompt to the LLM and get a summary
+# ---------------------------------------------------------------------------
+
+
+def build_user_prompt(stories: list[Story]) -> str:
+    """Turn structured stories into one user message for the model."""
+    lines: list[str] = [
+        "Here are the latest headlines with links and short blurbs from RSS.",
+        "Write a concise briefing: bullet list of themes, 2–3 sentences per major theme,",
+        "mention which story/link supports each point when useful.",
+        "",
+    ]
+    for i, s in enumerate(stories, start=1):
+        when = s.published.isoformat() if s.published else "unknown date"
+        lines.append(f"{i}. {s.title}")
+        lines.append(f"   Link: {s.link}")
+        lines.append(f"   Date: {when}")
+        if s.summary:
+            # Truncate very long HTML summaries
+            snippet = s.summary[:800] + ("…" if len(s.summary) > 800 else "")
+            lines.append(f"   Snippet: {snippet}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def summarize_with_llm(client: OpenAI, model: str, stories: list[Story]) -> str:
+    """Step 3: one chat completion — the 'agent action' for this demo."""
+    user_content = build_user_prompt(stories)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful news assistant. Be factual; do not invent events. "
+                    "If the snippets are thin, say what is unknown."
+                ),
+            },
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.4,
+    )
+    choice = response.choices[0].message.content
+    return (choice or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Main — orchestrates the workflow
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    settings = load_settings()
+
+    if not settings.openai_api_key:
+        print(
+            "Missing OPENAI_API_KEY. Copy .env.example to .env and set your key.\n"
+            "Questions: Do you use OpenAI, Azure OpenAI, or a local OpenAI-compatible server? "
+            "Set OPENAI_BASE_URL accordingly for non-default hosts.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Step 1 — Fetching RSS feeds…")
+    stories = fetch_all_stories(settings.rss_urls)
+    if not stories:
+        print(
+            "No stories fetched. Check RSS URLs and your network.\n"
+            "Set RSS_FEEDS in .env to comma-separated feed URLs.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"         Collected {len(stories)} raw entries from {len(settings.rss_urls)} feed(s).")
+
+    print("Step 2 — Selecting top stories by date…")
+    top = select_top_stories(stories, settings.top_n)
+    print(f"         Keeping top {len(top)} for the LLM.")
+
+    print("Step 3 — Calling LLM for summary…")
+    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
+    if settings.openai_base_url:
+        client_kwargs["base_url"] = settings.openai_base_url
+    client = OpenAI(**client_kwargs)
+
+    summary = summarize_with_llm(client, settings.model, top)
+    print("\n--- Briefing ---\n")
+    print(summary)
+    print("\n--- End ---")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

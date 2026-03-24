@@ -1,0 +1,8 @@
+# RSS parsing
+feedparser>=6.0.11
+
+# LLM calls (OpenAI API; works with OpenAI, Azure OpenAI, and OpenAI-compatible servers)
+openai>=1.50.0
+
+# Load API keys from a .env file (optional but recommended)
+python-dotenv>=1.0.1
