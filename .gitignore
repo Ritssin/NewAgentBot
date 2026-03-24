@@ -3,6 +3,9 @@
 venv/
 # Generated briefing (re-create with: python news_agent.py)
 output/
+
+# Local UI/settings (copy from config/settings.example.json)
+config/settings.json
 __pycache__/
 *.py[cod]
 *.egg-info/

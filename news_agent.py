@@ -1,23 +1,18 @@
 """
-Simple "agentic" news workflow in one script (easy to read top-to-bottom).
+Simple "agentic" news workflow: perceive (RSS) → select (top stories) → act (LLM) → deliver (HTML).
 
-What is "agentic" here?
------------------------
-We chain explicit steps: perceive (RSS) → select (top stories) → act (call LLM).
-There is no tool loop yet; the point is to see the pipeline clearly. You can
-later swap the LLM step for a planner that calls tools (search, email, etc.).
+Configuration:
+- Preferred: config/settings.json (create from config/settings.example.json) — feeds, prompts, provider.
+- Secrets: .env — OPENAI_API_KEY, ANTHROPIC_API_KEY (never store keys in JSON).
 
-Run:
-    python -m venv .venv
-    .venv\\Scripts\\activate   # Windows
-    pip install -r requirements.txt
-    copy .env.example .env     # then edit .env
-    python news_agent.py
+Run CLI: python news_agent.py
+Run web:  python web_app.py
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -31,7 +26,7 @@ from openai import NotFoundError, OpenAI
 
 
 # ---------------------------------------------------------------------------
-# Step 0 — Configuration (environment + defaults)
+# Paths & defaults
 # ---------------------------------------------------------------------------
 
 DEFAULT_RSS_FEEDS = [
@@ -39,18 +34,26 @@ DEFAULT_RSS_FEEDS = [
     "http://rss.cnn.com/rss/cnn_topstories.rss",
 ]
 
-# How many items to keep after merging all feeds (by recency).
 TOP_N_STORIES = 8
-
-# Where the HTML briefing is written (override with OUTPUT_HTML in .env).
 DEFAULT_OUTPUT_HTML = "output/briefing.html"
+SETTINGS_PATH = Path(os.getenv("NEWS_AGENT_SETTINGS", "config/settings.json"))
+SETTINGS_EXAMPLE_PATH = Path("config/settings.example.json")
 
-# Ollama serves an OpenAI-compatible API (see https://github.com/ollama/ollama/blob/main/docs/openai.md ).
 OLLAMA_OPENAI_BASE_URL = "http://localhost:11434/v1"
-# Default only if OPENAI_MODEL is unset; must match `ollama list` (e.g. llama3, llama3:latest).
 OLLAMA_DEFAULT_MODEL = "llama3"
-# The Python SDK requires a non-empty key; Ollama ignores it locally.
 OLLAMA_PLACEHOLDER_API_KEY = "ollama"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a careful news assistant. Be factual; do not invent events. "
+    "If the snippets are thin, say what is unknown."
+)
+
+DEFAULT_USER_PROMPT_TEMPLATE = (
+    "Here are the latest headlines with links and short blurbs from RSS.\n"
+    "Write a concise briefing: bullet list of themes, 2–3 sentences per major theme,\n"
+    "mention which story/link supports each point when useful.\n\n"
+    "{stories}"
+)
 
 
 def _env_truthy(name: str) -> bool:
@@ -58,75 +61,164 @@ def _env_truthy(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-def _use_ollama_backend() -> bool:
+def _llm_provider_from_env() -> str:
+    p = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if p in ("openai", "ollama", "claude"):
+        return p
     backend = os.getenv("LLM_BACKEND", "").strip().lower()
     if backend == "ollama":
-        return True
+        return "ollama"
+    if backend == "claude":
+        return "claude"
     if backend == "openai":
-        return False
-    if backend == "":
-        return _env_truthy("USE_OLLAMA")
-    raise ValueError(f"Unknown LLM_BACKEND={backend!r}; use 'openai' or 'ollama'.")
+        return "openai"
+    if backend:
+        raise ValueError(f"Unknown LLM_BACKEND={backend!r}; use openai, ollama, or claude.")
+    if _env_truthy("USE_OLLAMA"):
+        return "ollama"
+    return "openai"
 
 
 @dataclass(frozen=True)
 class Settings:
-    """All runtime settings in one place."""
-
     rss_urls: list[str]
     top_n: int
+    llm_provider: str
+    model: str
     openai_api_key: str
     openai_base_url: str | None
-    model: str
+    anthropic_api_key: str
     output_html: str
-    llm_backend: str
+    system_prompt: str
+    user_prompt_template: str
+
+
+def _load_json_settings() -> dict[str, Any] | None:
+    if not SETTINGS_PATH.is_file():
+        return None
+    raw = SETTINGS_PATH.read_text(encoding="utf-8")
+    return json.loads(raw)
+
+
+def default_settings_dict() -> dict[str, Any]:
+    """Defaults for new installs and the web UI."""
+    return {
+        "llm_provider": "openai",
+        "model": "gpt-4o-mini",
+        "openai_base_url": "",
+        "rss_feeds": list(DEFAULT_RSS_FEEDS),
+        "top_n": TOP_N_STORIES,
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "user_prompt_template": DEFAULT_USER_PROMPT_TEMPLATE,
+        "output_html": DEFAULT_OUTPUT_HTML,
+    }
+
+
+def merge_settings_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in overlay.items():
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def _env_settings_overlay() -> dict[str, Any]:
+    """When no settings.json exists, mirror legacy .env configuration."""
+    overlay: dict[str, Any] = {"llm_provider": _llm_provider_from_env()}
+    feeds = os.getenv("RSS_FEEDS", "").strip()
+    if feeds:
+        overlay["rss_feeds"] = [u.strip() for u in feeds.split(",") if u.strip()]
+    if os.getenv("TOP_N_STORIES", "").strip():
+        overlay["top_n"] = int(os.getenv("TOP_N_STORIES", "8"))
+    if os.getenv("OPENAI_MODEL", "").strip():
+        overlay["model"] = os.getenv("OPENAI_MODEL", "").strip()
+    if os.getenv("OPENAI_BASE_URL", "").strip():
+        overlay["openai_base_url"] = os.getenv("OPENAI_BASE_URL", "").strip()
+    if os.getenv("OUTPUT_HTML", "").strip():
+        overlay["output_html"] = os.getenv("OUTPUT_HTML", "").strip()
+    if os.getenv("SYSTEM_PROMPT", "").strip():
+        overlay["system_prompt"] = os.getenv("SYSTEM_PROMPT", "").strip()
+    if os.getenv("USER_PROMPT_TEMPLATE", "").strip():
+        overlay["user_prompt_template"] = os.getenv("USER_PROMPT_TEMPLATE", "").strip()
+    return overlay
 
 
 def load_settings() -> Settings:
+    """Load config/settings.json if present; merge with .env for API keys and env-only overrides."""
     load_dotenv()
-    feeds_env = os.getenv("RSS_FEEDS")
-    if feeds_env:
-        rss_urls = [u.strip() for u in feeds_env.split(",") if u.strip()]
+    data = default_settings_dict()
+    file_data = _load_json_settings()
+    if file_data:
+        data = merge_settings_dict(data, file_data)
     else:
-        rss_urls = list(DEFAULT_RSS_FEEDS)
+        data = merge_settings_dict(data, _env_settings_overlay())
 
-    top_n = int(os.getenv("TOP_N_STORIES", str(TOP_N_STORIES)))
-    output_html = os.getenv("OUTPUT_HTML", DEFAULT_OUTPUT_HTML).strip()
-
-    use_ollama = _use_ollama_backend()
-    if use_ollama:
-        # Same env names as OpenAI path so one .env can switch backends easily.
-        base_raw = os.getenv("OPENAI_BASE_URL", OLLAMA_OPENAI_BASE_URL).strip()
-        base_url = base_raw or OLLAMA_OPENAI_BASE_URL
-        api_key = os.getenv("OPENAI_API_KEY", OLLAMA_PLACEHOLDER_API_KEY).strip() or OLLAMA_PLACEHOLDER_API_KEY
-        model = os.getenv("OPENAI_MODEL", OLLAMA_DEFAULT_MODEL).strip() or OLLAMA_DEFAULT_MODEL
-        llm_backend = "ollama"
+    rss = data.get("rss_feeds") or list(DEFAULT_RSS_FEEDS)
+    if isinstance(rss, str):
+        rss = [u.strip() for u in rss.replace(",", "\n").splitlines() if u.strip()]
     else:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-        llm_backend = "openai"
+        rss = [str(u).strip() for u in rss if str(u).strip()]
+
+    top_n = int(data.get("top_n", TOP_N_STORIES))
+    output_html = str(data.get("output_html", DEFAULT_OUTPUT_HTML)).strip() or DEFAULT_OUTPUT_HTML
+    system_prompt = str(data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)).strip() or DEFAULT_SYSTEM_PROMPT
+    user_prompt_template = (
+        str(data.get("user_prompt_template", DEFAULT_USER_PROMPT_TEMPLATE)).strip() or DEFAULT_USER_PROMPT_TEMPLATE
+    )
+
+    provider = str(data.get("llm_provider", _llm_provider_from_env())).strip().lower()
+    if provider not in ("openai", "ollama", "claude"):
+        raise ValueError(f"Unknown llm_provider={provider!r}; use openai, ollama, or claude.")
+
+    model_raw = str(data.get("model", "")).strip()
+    openai_base_raw = str(data.get("openai_base_url", "")).strip()
+
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+    if provider == "ollama":
+        model = model_raw or OLLAMA_DEFAULT_MODEL
+        base_url = openai_base_raw or OLLAMA_OPENAI_BASE_URL
+        api_key = openai_key or OLLAMA_PLACEHOLDER_API_KEY
+    elif provider == "openai":
+        model = model_raw or "gpt-4o-mini"
+        base_url = openai_base_raw or None
+        api_key = openai_key
+    else:
+        model = model_raw or "claude-3-5-haiku-20241022"
+        base_url = None
+        api_key = openai_key
 
     return Settings(
-        rss_urls=rss_urls,
+        rss_urls=rss,
         top_n=top_n,
+        llm_provider=provider,
+        model=model,
         openai_api_key=api_key,
         openai_base_url=base_url,
-        model=model,
+        anthropic_api_key=anthropic_key,
         output_html=output_html,
-        llm_backend=llm_backend,
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
     )
 
 
+def settings_dict_for_ui() -> dict[str, Any]:
+    """Data for the web form (no secrets)."""
+    base = default_settings_dict()
+    file_data = _load_json_settings()
+    if file_data:
+        return merge_settings_dict(base, file_data)
+    return merge_settings_dict(base, _env_settings_overlay())
+
+
 # ---------------------------------------------------------------------------
-# Step 1 — Perceive: fetch and parse RSS
+# Step 1 — RSS
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Story:
-    """One news item we can summarize."""
-
     title: str
     link: str
     summary: str
@@ -134,7 +226,6 @@ class Story:
 
 
 def _parse_published(entry: Any) -> datetime | None:
-    """Best-effort parse of RSS/Atom date fields."""
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         t = entry.published_parsed
         try:
@@ -151,7 +242,6 @@ def _parse_published(entry: Any) -> datetime | None:
 
 
 def fetch_stories_from_feed(url: str) -> list[Story]:
-    """Download one feed and normalize entries to Story objects."""
     parsed = feedparser.parse(url)
     if not parsed.entries:
         exc = getattr(parsed, "bozo_exception", None)
@@ -163,7 +253,6 @@ def fetch_stories_from_feed(url: str) -> list[Story]:
         title = (entry.get("title") or "").strip()
         link = (entry.get("link") or "").strip()
         summary = (entry.get("summary") or entry.get("description") or "").strip()
-        # Strip basic HTML noise from some feeds (keep it simple).
         summary = summary.replace("<![CDATA[", "").replace("]]>", "")
         if not title:
             continue
@@ -172,7 +261,6 @@ def fetch_stories_from_feed(url: str) -> list[Story]:
 
 
 def fetch_all_stories(urls: list[str]) -> list[Story]:
-    """Step 1 (full): aggregate stories from every configured feed."""
     all_stories: list[Story] = []
     for url in urls:
         try:
@@ -183,17 +271,11 @@ def fetch_all_stories(urls: list[str]) -> list[Story]:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Select: rank and take top N (by publication time)
+# Step 2 — Select
 # ---------------------------------------------------------------------------
 
 
 def select_top_stories(stories: list[Story], n: int) -> list[Story]:
-    """
-    Step 2: choose the N most recent items.
-
-    Real agents might use relevance scoring, deduplication, or user prefs here.
-    """
-    # None dates sort last
     def sort_key(s: Story) -> datetime:
         return s.published or datetime.min.replace(tzinfo=timezone.utc)
 
@@ -202,69 +284,105 @@ def select_top_stories(stories: list[Story], n: int) -> list[Story]:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Act: send a prompt to the LLM and get a summary
+# Step 3 — Prompts & LLM
 # ---------------------------------------------------------------------------
 
 
-def build_user_prompt(stories: list[Story]) -> str:
-    """Turn structured stories into one user message for the model."""
-    lines: list[str] = [
-        "Here are the latest headlines with links and short blurbs from RSS.",
-        "Write a concise briefing: bullet list of themes, 2–3 sentences per major theme,",
-        "mention which story/link supports each point when useful.",
-        "",
-    ]
+def format_stories_block(stories: list[Story]) -> str:
+    """Numbered list of stories for the user message."""
+    lines: list[str] = []
     for i, s in enumerate(stories, start=1):
         when = s.published.isoformat() if s.published else "unknown date"
         lines.append(f"{i}. {s.title}")
         lines.append(f"   Link: {s.link}")
         lines.append(f"   Date: {when}")
         if s.summary:
-            # Truncate very long HTML summaries
             snippet = s.summary[:800] + ("…" if len(s.summary) > 800 else "")
             lines.append(f"   Snippet: {snippet}")
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
-def summarize_with_llm(client: OpenAI, model: str, stories: list[Story]) -> str:
-    """Step 3: one chat completion — the 'agent action' for this demo."""
-    user_content = build_user_prompt(stories)
+def build_user_content(stories: list[Story], user_prompt_template: str) -> str:
+    block = format_stories_block(stories)
+    tpl = user_prompt_template.strip()
+    if "{stories}" in tpl:
+        return tpl.replace("{stories}", block)
+    return tpl.rstrip() + "\n\n" + block
+
+
+def summarize_openai_compatible(
+    *,
+    api_key: str,
+    base_url: str | None,
+    model: str,
+    system_prompt: str,
+    user_content: str,
+    temperature: float = 0.4,
+) -> str:
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful news assistant. Be factual; do not invent events. "
-                    "If the snippets are thin, say what is unknown."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.4,
+        temperature=temperature,
     )
     choice = response.choices[0].message.content
     return (choice or "").strip()
 
 
-# ---------------------------------------------------------------------------
-# Step 4 — Deliver: write a local HTML file (easy to open in a browser)
-# ---------------------------------------------------------------------------
-
-
-def write_briefing_html(
-    path: str,
-    summary: str,
-    stories: list[Story],
+def summarize_claude(
+    *,
+    api_key: str,
     model: str,
-) -> None:
-    """
-    Build a single self-contained HTML page.
+    system_prompt: str,
+    user_content: str,
+) -> str:
+    from anthropic import Anthropic
 
-    The LLM text is escaped so arbitrary model output cannot inject HTML/JS.
-    Story titles and links are escaped; links use a safe attribute.
-    """
+    client = Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    parts: list[str] = []
+    for block in msg.content:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text)
+    return "\n".join(parts).strip()
+
+
+def summarize_with_settings(settings: Settings, stories: list[Story]) -> str:
+    user_content = build_user_content(stories, settings.user_prompt_template)
+    if settings.llm_provider == "claude":
+        return summarize_claude(
+            api_key=settings.anthropic_api_key,
+            model=settings.model,
+            system_prompt=settings.system_prompt,
+            user_content=user_content,
+        )
+    return summarize_openai_compatible(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        model=settings.model,
+        system_prompt=settings.system_prompt,
+        user_content=user_content,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — HTML file
+# ---------------------------------------------------------------------------
+
+
+def write_briefing_html(path: str, summary: str, stories: list[Story], model: str, provider: str) -> None:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     esc_summary = html.escape(summary, quote=False)
 
@@ -279,6 +397,7 @@ def write_briefing_html(
             items.append(f"<li>{title} — {when}</li>")
 
     stories_html = "\n    ".join(items) if items else "<li>(no stories)</li>"
+    meta_model = html.escape(f"{provider} · {model}", quote=True)
 
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -299,7 +418,7 @@ def write_briefing_html(
 </head>
 <body>
   <h1>News briefing</h1>
-  <p class="meta">Generated {html.escape(generated, quote=True)} · Model {html.escape(model, quote=True)}</p>
+  <p class="meta">Generated {html.escape(generated, quote=True)} · {meta_model}</p>
   <h2>Summary</h2>
   <div class="summary">{esc_summary}</div>
   <h2>Sources (top stories sent to the model)</h2>
@@ -315,69 +434,89 @@ def write_briefing_html(
 
 
 # ---------------------------------------------------------------------------
-# Main — orchestrates the workflow
+# Pipeline (CLI + web)
 # ---------------------------------------------------------------------------
+
+
+def validate_settings_for_run(settings: Settings) -> str | None:
+    if settings.llm_provider == "openai" and not settings.openai_api_key:
+        return "Missing OPENAI_API_KEY in .env (required for OpenAI)."
+    if settings.llm_provider == "claude" and not settings.anthropic_api_key:
+        return "Missing ANTHROPIC_API_KEY in .env (required for Claude)."
+    if not settings.rss_urls:
+        return "Add at least one RSS feed URL."
+    return None
+
+
+def run_pipeline(settings: Settings, *, verbose: bool = True) -> tuple[int, str | None, str | None]:
+    """
+    Returns (exit_code, summary_text_or_none, error_message_or_none).
+    On success exit_code 0 and summary is set; on failure exit_code non-zero and error_message is set.
+    """
+    err = validate_settings_for_run(settings)
+    if err:
+        return 1, None, err
+
+    if verbose:
+        print("Step 1 — Fetching RSS feeds…")
+    stories = fetch_all_stories(settings.rss_urls)
+    if not stories:
+        return 1, None, "No stories fetched. Check RSS URLs and your network."
+
+    if verbose:
+        print(f"         Collected {len(stories)} raw entries from {len(settings.rss_urls)} feed(s).")
+        print("Step 2 — Selecting top stories by date…")
+    top = select_top_stories(stories, settings.top_n)
+    if verbose:
+        print(f"         Keeping top {len(top)} for the LLM.")
+        print(f"Step 3 — Calling LLM ({settings.llm_provider})…")
+
+    try:
+        summary = summarize_with_settings(settings, top)
+    except NotFoundError:
+        if settings.llm_provider == "ollama":
+            return (
+                1,
+                None,
+                f"Ollama has no model {settings.model!r}. Run: ollama pull {settings.model}  (see also: ollama list)",
+            )
+        return 1, None, "Model not found (404). Check the model id for your provider."
+    except Exception as e:
+        return 1, None, f"{type(e).__name__}: {e}"
+
+    if verbose:
+        print("Step 4 — Writing HTML briefing…")
+    write_briefing_html(settings.output_html, summary, top, settings.model, settings.llm_provider)
+    if verbose:
+        print(f"         Saved: {settings.output_html}")
+        print("\n--- Briefing ---\n")
+        print(summary)
+        print("\n--- End ---")
+
+    return 0, summary, None
+
+
+def ensure_settings_file() -> None:
+    """Copy example JSON if no settings file exists."""
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not SETTINGS_PATH.is_file() and SETTINGS_EXAMPLE_PATH.is_file():
+        SETTINGS_PATH.write_text(SETTINGS_EXAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def main() -> int:
     try:
         settings = load_settings()
-    except ValueError as err:
-        print(str(err), file=sys.stderr)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON in {SETTINGS_PATH}: {e}", file=sys.stderr)
         return 1
 
-    if settings.llm_backend == "openai" and not settings.openai_api_key:
-        print(
-            "Missing OPENAI_API_KEY. Copy .env.example to .env and set your key from "
-            "https://platform.openai.com/api-keys — or set USE_OLLAMA=1 for local Ollama.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print("Step 1 — Fetching RSS feeds…")
-    stories = fetch_all_stories(settings.rss_urls)
-    if not stories:
-        print(
-            "No stories fetched. Check RSS URLs and your network.\n"
-            "Set RSS_FEEDS in .env to comma-separated feed URLs.",
-            file=sys.stderr,
-        )
-        return 1
-    print(f"         Collected {len(stories)} raw entries from {len(settings.rss_urls)} feed(s).")
-
-    print("Step 2 — Selecting top stories by date…")
-    top = select_top_stories(stories, settings.top_n)
-    print(f"         Keeping top {len(top)} for the LLM.")
-
-    print(f"Step 3 — Calling LLM for summary ({settings.llm_backend})…")
-    client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
-    if settings.openai_base_url:
-        client_kwargs["base_url"] = settings.openai_base_url
-    client = OpenAI(**client_kwargs)
-
-    try:
-        summary = summarize_with_llm(client, settings.model, top)
-    except NotFoundError as err:
-        if settings.llm_backend == "ollama":
-            print(
-                f"Ollama does not have model {settings.model!r} (404).\n"
-                f"  Install:  ollama pull {settings.model}\n"
-                f"  Or pick a name from:  ollama list\n"
-                f"Then set OPENAI_MODEL in .env to that exact name.",
-                file=sys.stderr,
-            )
-        else:
-            print(f"Model not found: {err}", file=sys.stderr)
-        return 1
-
-    print("Step 4 — Writing HTML briefing…")
-    write_briefing_html(settings.output_html, summary, top, settings.model)
-    print(f"         Saved: {settings.output_html}")
-
-    print("\n--- Briefing (same as in HTML) ---\n")
-    print(summary)
-    print("\n--- End ---")
-    return 0
+    code, _summary, err = run_pipeline(settings, verbose=True)
+    if err:
+        print(err, file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

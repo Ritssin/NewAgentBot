@@ -1,0 +1,13 @@
+{
+  "llm_provider": "openai",
+  "model": "gpt-4o-mini",
+  "openai_base_url": "",
+  "rss_feeds": [
+    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml",
+    "http://rss.cnn.com/rss/cnn_topstories.rss"
+  ],
+  "top_n": 8,
+  "system_prompt": "You are a careful news assistant. Be factual; do not invent events. If the snippets are thin, say what is unknown.",
+  "user_prompt_template": "Here are the latest headlines with links and short blurbs from RSS.\nWrite a concise briefing: bullet list of themes, 2–3 sentences per major theme,\nmention which story/link supports each point when useful.\n\n{stories}",
+  "output_html": "output/briefing.html"
+}

@@ -1,8 +1,14 @@
 # RSS parsing
 feedparser>=6.0.11
 
-# LLM calls (OpenAI API; works with OpenAI, Azure OpenAI, and OpenAI-compatible servers)
+# LLM: OpenAI + OpenAI-compatible (Ollama)
 openai>=1.50.0
 
-# Load API keys from a .env file (optional but recommended)
+# LLM: Anthropic Claude
+anthropic>=0.40.0
+
+# Web UI
+flask>=3.0.0
+
+# Load API keys from a .env file
 python-dotenv>=1.0.1

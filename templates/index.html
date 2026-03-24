@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>News Agent — Configuration</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="page-header">
+    <h1>News Agent</h1>
+    <p class="lede">Configure RSS feeds, prompts, and LLM. Keys stay in <code>.env</code> only.</p>
+    <p class="meta">Settings file: <code>{{ settings_path }}</code></p>
+  </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <ul class="flashes">
+        {% for category, message in messages %}
+          <li class="flash flash-{{ category }}">{{ message }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+
+  <section class="keys">
+    <h2>API keys (.env)</h2>
+    <ul class="key-status">
+      <li>OpenAI: {% if has_openai_key %}<span class="ok">set</span>{% else %}<span class="missing">not set</span> (needed for OpenAI / Ollama uses OpenAI client){% endif %}</li>
+      <li>Anthropic: {% if has_anthropic_key %}<span class="ok">set</span>{% else %}<span class="missing">not set</span> (needed for Claude){% endif %}</li>
+    </ul>
+  </section>
+
+  <form method="post" action="{{ url_for('index') }}" class="config-form">
+    <fieldset>
+      <legend>LLM</legend>
+      <label for="llm_provider">Provider</label>
+      <select id="llm_provider" name="llm_provider">
+        <option value="openai" {% if settings.llm_provider == 'openai' %}selected{% endif %}>OpenAI</option>
+        <option value="ollama" {% if settings.llm_provider == 'ollama' %}selected{% endif %}>Ollama (local)</option>
+        <option value="claude" {% if settings.llm_provider == 'claude' %}selected{% endif %}>Claude (Anthropic)</option>
+      </select>
+
+      <label for="model">Model id</label>
+      <input type="text" id="model" name="model" value="{{ settings.model }}" placeholder="e.g. gpt-4o-mini, llama3, claude-3-5-haiku-20241022">
+
+      <label for="openai_base_url">Base URL (optional)</label>
+      <input type="text" id="openai_base_url" name="openai_base_url" value="{{ settings.openai_base_url or '' }}" placeholder="Leave empty for OpenAI; Ollama default http://localhost:11434/v1">
+      <p class="hint">Ollama: usually leave blank to use <code>http://localhost:11434/v1</code>. OpenAI: leave blank for the default API.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>RSS feeds</legend>
+      <label for="rss_feeds">One URL per line</label>
+      <textarea id="rss_feeds" name="rss_feeds" rows="8" placeholder="https://example.com/feed.xml">{{ settings.rss_feeds | join('\n') }}</textarea>
+    </fieldset>
+
+    <fieldset>
+      <legend>Prompts</legend>
+      <p class="hint">Use <code>{stories}</code> in the user prompt where the numbered headline list should appear. If omitted, stories are appended at the end.</p>
+
+      <label for="system_prompt">System prompt</label>
+      <textarea id="system_prompt" name="system_prompt" rows="4">{{ settings.system_prompt }}</textarea>
+
+      <label for="user_prompt_template">User prompt</label>
+      <textarea id="user_prompt_template" name="user_prompt_template" rows="10">{{ settings.user_prompt_template }}</textarea>
+    </fieldset>
+
+    <fieldset>
+      <legend>Output</legend>
+      <label for="top_n">Top stories to send (1–50)</label>
+      <input type="number" id="top_n" name="top_n" min="1" max="50" value="{{ settings.top_n }}">
+
+      <label for="output_html">HTML report path</label>
+      <input type="text" id="output_html" name="output_html" value="{{ settings.output_html }}">
+    </fieldset>
+
+    <div class="actions">
+      <button type="submit" name="action" value="save" class="btn secondary">Save configuration</button>
+      <button type="submit" name="action" value="run" class="btn primary">Save &amp; run briefing</button>
+    </div>
+  </form>
+</body>
+</html>

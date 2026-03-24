@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Briefing result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="page-header">
+    <h1>Briefing</h1>
+    <p class="meta">{{ provider }} · {{ model }} — also written to <code>{{ output_path }}</code></p>
+    <p><a href="{{ url_for('index') }}">← Back to configuration</a></p>
+  </header>
+
+  <section class="summary-box">
+    <pre class="summary-text">{{ summary }}</pre>
+  </section>
+</body>
+</html>
