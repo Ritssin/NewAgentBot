@@ -35,8 +35,8 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 
 DEFAULT_RSS_FEEDS = [
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://rss.cnn.com/rss/edition_world.rss",
+    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml",
+    "http://rss.cnn.com/rss/cnn_topstories.rss",
 ]
 
 # How many items to keep after merging all feeds (by recency).
@@ -44,6 +44,28 @@ TOP_N_STORIES = 8
 
 # Where the HTML briefing is written (override with OUTPUT_HTML in .env).
 DEFAULT_OUTPUT_HTML = "output/briefing.html"
+
+# Ollama serves an OpenAI-compatible API (see https://github.com/ollama/ollama/blob/main/docs/openai.md ).
+OLLAMA_OPENAI_BASE_URL = "http://localhost:11434/v1"
+OLLAMA_DEFAULT_MODEL = "llama3.2"
+# The Python SDK requires a non-empty key; Ollama ignores it locally.
+OLLAMA_PLACEHOLDER_API_KEY = "ollama"
+
+
+def _env_truthy(name: str) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _use_ollama_backend() -> bool:
+    backend = os.getenv("LLM_BACKEND", "").strip().lower()
+    if backend == "ollama":
+        return True
+    if backend == "openai":
+        return False
+    if backend == "":
+        return _env_truthy("USE_OLLAMA")
+    raise ValueError(f"Unknown LLM_BACKEND={backend!r}; use 'openai' or 'ollama'.")
 
 
 @dataclass(frozen=True)
@@ -56,6 +78,7 @@ class Settings:
     openai_base_url: str | None
     model: str
     output_html: str
+    llm_backend: str
 
 
 def load_settings() -> Settings:
@@ -67,10 +90,21 @@ def load_settings() -> Settings:
         rss_urls = list(DEFAULT_RSS_FEEDS)
 
     top_n = int(os.getenv("TOP_N_STORIES", str(TOP_N_STORIES)))
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
     output_html = os.getenv("OUTPUT_HTML", DEFAULT_OUTPUT_HTML).strip()
+
+    use_ollama = _use_ollama_backend()
+    if use_ollama:
+        # Same env names as OpenAI path so one .env can switch backends easily.
+        base_raw = os.getenv("OPENAI_BASE_URL", OLLAMA_OPENAI_BASE_URL).strip()
+        base_url = base_raw or OLLAMA_OPENAI_BASE_URL
+        api_key = os.getenv("OPENAI_API_KEY", OLLAMA_PLACEHOLDER_API_KEY).strip() or OLLAMA_PLACEHOLDER_API_KEY
+        model = os.getenv("OPENAI_MODEL", OLLAMA_DEFAULT_MODEL).strip() or OLLAMA_DEFAULT_MODEL
+        llm_backend = "ollama"
+    else:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        llm_backend = "openai"
 
     return Settings(
         rss_urls=rss_urls,
@@ -79,6 +113,7 @@ def load_settings() -> Settings:
         openai_base_url=base_url,
         model=model,
         output_html=output_html,
+        llm_backend=llm_backend,
     )
 
 
@@ -284,12 +319,16 @@ def write_briefing_html(
 
 
 def main() -> int:
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except ValueError as err:
+        print(str(err), file=sys.stderr)
+        return 1
 
-    if not settings.openai_api_key:
+    if settings.llm_backend == "openai" and not settings.openai_api_key:
         print(
             "Missing OPENAI_API_KEY. Copy .env.example to .env and set your key from "
-            "https://platform.openai.com/api-keys",
+            "https://platform.openai.com/api-keys — or set USE_OLLAMA=1 for local Ollama.",
             file=sys.stderr,
         )
         return 1
@@ -309,7 +348,7 @@ def main() -> int:
     top = select_top_stories(stories, settings.top_n)
     print(f"         Keeping top {len(top)} for the LLM.")
 
-    print("Step 3 — Calling LLM for summary…")
+    print(f"Step 3 — Calling LLM for summary ({settings.llm_backend})…")
     client_kwargs: dict[str, Any] = {"api_key": settings.openai_api_key}
     if settings.openai_base_url:
         client_kwargs["base_url"] = settings.openai_base_url
